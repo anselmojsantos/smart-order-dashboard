@@ -1,0 +1,4 @@
+streamlit==x.x.x
+pandas==x.x.x
+plotly==x.x.x
+psycopg2-binary==x.x.x
