@@ -1,8 +1,12 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
 import psycopg2
 import plotly.express as px
 from datetime import datetime, timedelta
+from sklearn.linear_model import LinearRegression
 
 st.set_page_config(page_title="Dashboard Smart Order", layout="wide")
 st.title("🍽️ Dashboard Smart Order")
@@ -19,13 +23,99 @@ DB_CONFIG = {
     "port": st.secrets["DB_PORT"]
 }
 
+# =============================================
+# MODELOS DE PROJEÇÃO
+# =============================================
+
+def fazer_projecao_linear(dados_timeline, dias_projecao=30):    
+    if dados_timeline.empty or len(dados_timeline) < 2:
+        return None    
+     
+    dados_timeline = dados_timeline.sort_values('data')
+    dados_timeline['dias'] = (dados_timeline['data'] - dados_timeline['data'].min()).dt.days
+    
+    X = dados_timeline[['dias']].values
+    y = dados_timeline['valor_total'].values
+    
+    modelo = LinearRegression()
+    modelo.fit(X, y)
+    
+    ultima_data = dados_timeline['data'].max()
+    dias_futuros = np.array(range(1, dias_projecao + 1)).reshape(-1, 1)
+    dias_totais = np.array(range(len(X), len(X) + dias_projecao)).reshape(-1, 1)
+    
+    projecoes = modelo.predict(dias_totais)
+    
+    datas_futuras = [ultima_data + timedelta(days=i) for i in range(1, dias_projecao + 1)]
+    
+    projecao_df = pd.DataFrame({
+        'data': datas_futuras,
+        'valor_total': projecoes,
+        'tipo': 'Projeção'
+    })
+    
+    dados_historicos = dados_timeline.copy()
+    dados_historicos['tipo'] = 'Histórico'
+    
+    return dados_historicos, projecao_df, modelo
+
+def fazer_projecao_conservadora(dados_timeline, dias_projecao=30):
+    """Projeção conservadora para poucos dados (menos de 7 dias)"""
+    if len(dados_timeline) < 2:
+        return None
+    
+    dados = dados_timeline.sort_values('data')
+    media = dados['valor_total'].mean()   
+    ultimo_valor = dados['valor_total'].iloc[-1]   
+    crescimento_maximo = media * 0.02   
+    
+    if len(dados) > 1:
+        crescimento_historico = (ultimo_valor - dados['valor_total'].iloc[0]) / (len(dados) - 1)
+        crescimento_suavizado = min(crescimento_historico, crescimento_maximo)
+    else:
+        crescimento_suavizado = crescimento_maximo
+    
+    crescimento_suavizado = max(crescimento_suavizado, 0)
+    
+    ultima_data = dados['data'].max()
+    projecoes = []
+    
+    for i in range(1, dias_projecao + 1):
+        valor_projetado = ultimo_valor + (crescimento_suavizado * i)
+         
+        limite_superior = media * 1.5   
+        valor_projetado = min(valor_projetado, limite_superior)
+        projecoes.append(valor_projetado)
+    
+    datas_futuras = [ultima_data + timedelta(days=i) for i in range(1, dias_projecao + 1)]
+    
+    projecao_df = pd.DataFrame({
+        'data': datas_futuras,
+        'valor_total': projecoes,
+        'tipo': 'Projeção (Conservadora)'
+    })
+    
+    dados['tipo'] = 'Histórico'
+    return dados, projecao_df, crescimento_suavizado
+
+def fazer_projecao_inteligente(dados_timeline, dias_projecao=30):
+     
+    if len(dados_timeline) < 2:
+        return None
+    
+    if len(dados_timeline) >= 7:
+         
+        return fazer_projecao_linear(dados_timeline, dias_projecao)
+    else:
+         
+        return fazer_projecao_conservadora(dados_timeline, dias_projecao)
 
 # =============================================
 # VERIFICAÇÃO DAS SECRETS
 # =============================================
 
 def verificar_secrets():
-    """Função para verificar se as secrets estão carregadas"""
+    
     st.sidebar.subheader("🔍 Status da Conexão")
     
     secrets_necessarias = ["DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_PORT"]
@@ -42,7 +132,7 @@ def verificar_secrets():
     
 
 def carregar_dados():
-    """Carrega todos os dados para o dashboard"""
+     
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         
@@ -56,7 +146,7 @@ def carregar_dados():
         WHERE "created_at" IS NOT NULL
         GROUP BY DATE("created_at")
         ORDER BY data DESC
-        LIMIT 90;
+        LIMIT 180;
         """
         timeline_data = pd.read_sql(query_timeline, conn)
 
@@ -156,7 +246,14 @@ st.sidebar.markdown("---")
 if not dados['timeline'].empty:
     st.sidebar.metric("💰 Faturamento Total", f"R$ {dados['timeline']['valor_total'].sum():,.2f}")
     st.sidebar.metric("📅 Período", f"{len(dados['timeline'])} dias")
-    
+
+if not dados['timeline'].empty:
+    projecao_resultado = fazer_projecao_inteligente(dados['timeline'])
+    if projecao_resultado:
+        dados_historicos, projecao_df, modelo = projecao_resultado
+        projecao_total_30d = projecao_df['valor_total'].sum()
+        st.sidebar.metric("🔮 Projeção 30 Dias", f"R$ {projecao_total_30d:,.2f}")
+
 if not dados['satisfacao'].empty:
     nota_media = (dados['satisfacao']['nota'] * dados['satisfacao']['quantidade']).sum() / dados['satisfacao']['quantidade'].sum()
     st.sidebar.metric("⭐ Satisfação Média", f"{nota_media:.1f}/5")
@@ -185,7 +282,7 @@ if not dados['timeline'].empty:
         st.metric("💳 Pagamentos", dados['timeline']['quantidade'].sum())
     with col4:
         ticket_medio = dados['timeline']['valor_total'].sum() / dados['timeline']['quantidade'].sum()
-        st.metric("🎫 Ticket Médio", f"R$ {ticket_medio:.2f}")
+        st.metric("🎫 Ticket Médio Por Cliente", f"R$ {ticket_medio:.2f}")
     
     fig_timeline = px.line(
         dados['timeline'],
@@ -202,7 +299,122 @@ else:
 st.markdown("---")
 
 # =============================================
-# SEÇÃO 2: TOP PRATOS + RANKING GARÇONS
+# SEÇÃO 2: PROJEÇÃO PARA OS PRÓXIMOS 30 DIAS
+# =============================================
+
+st.header("🔮 Projeção para os Próximos 30 Dias")
+
+if not dados['timeline'].empty:
+    # Escolher modelo automaticamente baseado na quantidade de dados
+    num_dias = len(dados['timeline'])
+    
+    if num_dias >= 7:
+        projecao_resultado = fazer_projecao_linear(dados['timeline'])
+        st.success(f"✅ Projeção com regressão linear ({num_dias} dias de dados)")
+    else:
+        projecao_resultado = fazer_projecao_conservadora(dados['timeline'])
+        st.warning(f"⚠️ Projeção conservadora ({num_dias} dias) - Aguarde 7 dias para maior precisão")
+    
+    if projecao_resultado:
+        dados_historicos, projecao_df, modelo = projecao_resultado
+        
+        # Mostrar dados históricos primeiro
+        st.subheader("📊 Dados Históricos (Base para Projeção)")
+        cols_historico = st.columns(min(3, len(dados_historicos)))
+        dados_sorted = dados_historicos.sort_values('data', ascending=False)
+        
+        for i, (_, row) in enumerate(dados_sorted.iterrows()):
+            with cols_historico[i]:
+                st.metric(
+                    f"📅 {row['data'].strftime('%d/%m/%Y')}",
+                    f"R$ {row['valor_total']:,.2f}",
+                    f"{int(row['quantidade'])} pagamentos"
+                )
+        st.markdown("\n")
+
+        # Métricas da projeção
+        st.subheader("📈 Métricas da Projeção")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            projecao_total_30d = projecao_df['valor_total'].sum()
+            st.metric("💰 Projeção 30 Dias", f"R$ {projecao_total_30d:,.2f}")
+        
+        with col2:
+            if isinstance(modelo, LinearRegression):
+                crescimento_diario = modelo.coef_[0]
+            else:
+                crescimento_diario = modelo  # No modelo conservador é o crescimento_suavizado
+            st.metric("📈 Crescimento Diário", f"R$ {crescimento_diario:.2f}")
+        
+        with col3:
+            ultimo_valor_historico = dados_historicos['valor_total'].iloc[-1]
+            primeiro_valor_projecao = projecao_df['valor_total'].iloc[0]
+            variacao = ((primeiro_valor_projecao - ultimo_valor_historico) / ultimo_valor_historico) * 100
+            st.metric("🔄 Variação Inicial", f"{variacao:+.1f}%")
+        
+        with col4:
+            valor_ultimo_dia_projecao = projecao_df['valor_total'].iloc[-1]
+            st.metric("🎯 Valor no Dia 30", f"R$ {valor_ultimo_dia_projecao:.2f}")
+
+        st.markdown("\n")
+        # Gráfico de projeção
+        st.subheader("📊 Gráfico de Projeção")
+        fig = go.Figure()
+        
+        # Histórico
+        fig.add_trace(go.Scatter(
+            x=dados_historicos['data'],
+            y=dados_historicos['valor_total'],
+            mode='lines+markers+text',
+            name='Dados Históricos',
+            line=dict(color='blue', width=3),
+            marker=dict(size=10),
+            text=[f"R$ {v:,.0f}" for v in dados_historicos['valor_total']],
+            textposition="top center"
+        ))
+        
+        # Projeção
+        cor_projecao = 'green' if num_dias >= 7 else 'orange'
+        nome_projecao = 'Projeção (Regressão Linear)' if num_dias >= 7 else 'Projeção (Conservadora)'
+        
+        fig.add_trace(go.Scatter(
+            x=projecao_df['data'],
+            y=projecao_df['valor_total'],
+            mode='lines+markers',
+            name=nome_projecao,
+            line=dict(color=cor_projecao, width=2, dash='dash'),
+            marker=dict(size=6)
+        ))
+        
+        fig.update_layout(
+            title=f'Projeção - Próximos 30 Dias (Base: {num_dias} dias históricos)',
+            xaxis_title='Data',
+            yaxis_title='Valor (R$)',
+            hovermode='x unified'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Tabela detalhada
+        with st.expander("📋 Ver Projeções Detalhadas"):
+            projecao_detalhada = projecao_df.copy()
+            projecao_detalhada['Dia'] = range(1, 31)
+            projecao_detalhada['Data'] = projecao_detalhada['data'].dt.strftime('%d/%m/%Y')
+            projecao_detalhada['Valor (R$)'] = projecao_detalhada['valor_total'].round(2)
+            projecao_detalhada['Dia Semana'] = projecao_detalhada['data'].dt.strftime('%A')
+            
+            st.dataframe(projecao_detalhada[['Dia', 'Data', 'Dia Semana', 'Valor (R$)']], 
+                        use_container_width=True, height=400)
+            
+            csv = projecao_detalhada[['Dia', 'Data', 'Dia Semana', 'Valor (R$)']].to_csv(index=False)
+            st.download_button("📥 Download CSV", data=csv, file_name="projecao_30_dias.csv", mime="text/csv")
+    else:
+        st.warning("📊 Dados insuficientes para projeção (mínimo 2 dias)")
+
+st.markdown("---")
+
+# =============================================
+# SEÇÃO 3: TOP PRATOS + RANKING GARÇONS
 # =============================================
 
 col1, col2 = st.columns(2)
@@ -244,7 +456,7 @@ with col2:
 st.markdown("---")
 
 # =============================================
-# SEÇÃO 3: PESQUISA DE SATISFAÇÃO
+# SEÇÃO 4: PESQUISA DE SATISFAÇÃO
 # =============================================
 
 st.header("⭐ Pesquisa de Satisfação")
@@ -316,7 +528,7 @@ else:
 st.markdown("---")
 
 # =============================================
-# SEÇÃO 4: TIPOS DE PAGAMENTO
+# SEÇÃO 5: TIPOS DE PAGAMENTO
 # =============================================
 
 st.header("💳 Tipos de Pagamento")
@@ -361,7 +573,7 @@ st.markdown("---")
 st.markdown(
     """
     <div style='text-align: center; color: gray; padding: 20px;'>
-        📊 Dashboard Smart Order • Desenvolvido com Streamlit • 
+        📊 Dashboard Smart Order • Desenvolvido com Streamlit pela equipe do PI-II UNIVESP • 
     </div>
     """, 
     unsafe_allow_html=True
