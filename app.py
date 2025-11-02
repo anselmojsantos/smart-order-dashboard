@@ -229,11 +229,11 @@ with col2:
     
     if not dados['garcons'].empty:
         fig_garcons = px.bar(
-            dados['garcons'].head(5),
+            dados['garcons'].head(6),
             y='garcom',
             x='total_pedidos',
             orientation='h',
-            title='Top 5 Garçons - Mais Pedidos',
+            title='Top 6 Garçons - Mais Pedidos',
             labels={'total_pedidos': 'Total de Pedidos', 'garcom': ''},
             color='total_pedidos'
         )
