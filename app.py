@@ -313,7 +313,6 @@ if not dados['timeline'].empty:
         st.success(f"✅ Projeção com regressão linear ({num_dias} dias de dados)")
     else:
         projecao_resultado = fazer_projecao_conservadora(dados['timeline'])
-        st.warning(f"⚠️ Projeção conservadora ({num_dias} dias) - Aguarde 7 dias para maior precisão")
     
     if projecao_resultado:
         dados_historicos, projecao_df, modelo = projecao_resultado
