@@ -1,240 +1,17 @@
+# app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import psycopg2
-import plotly.express as px
-from datetime import datetime, timedelta
+from database import carregar_dados
+from projecoes import projecao_media, projecao_linear
 from sklearn.linear_model import LinearRegression
 
 st.set_page_config(page_title="Dashboard Smart Order", layout="wide")
 st.title("🍽️ Dashboard Smart Order")
 
 # =============================================
-# CONFIGURAÇÃO DO BANCO
-# =============================================
-
-DB_CONFIG = {
-    "host": st.secrets["DB_HOST"],
-    "database": st.secrets["DB_NAME"], 
-    "user": st.secrets["DB_USER"],
-    "password": st.secrets["DB_PASSWORD"],
-    "port": st.secrets["DB_PORT"]
-}
-
-# =============================================
-# MODELOS DE PROJEÇÃO
-# =============================================
-
-def fazer_projecao_linear(dados_timeline, dias_projecao=30):    
-    if dados_timeline.empty or len(dados_timeline) < 2:
-        return None    
-     
-    dados_timeline = dados_timeline.sort_values('data')
-    dados_timeline['dias'] = (dados_timeline['data'] - dados_timeline['data'].min()).dt.days
-    
-    X = dados_timeline[['dias']].values
-    y = dados_timeline['valor_total'].values
-    
-    modelo = LinearRegression()
-    modelo.fit(X, y)
-    
-    ultima_data = dados_timeline['data'].max()
-    dias_futuros = np.array(range(1, dias_projecao + 1)).reshape(-1, 1)
-    dias_totais = np.array(range(len(X), len(X) + dias_projecao)).reshape(-1, 1)
-    
-    projecoes = modelo.predict(dias_totais)
-    
-    datas_futuras = [ultima_data + timedelta(days=i) for i in range(1, dias_projecao + 1)]
-    
-    projecao_df = pd.DataFrame({
-        'data': datas_futuras,
-        'valor_total': projecoes,
-        'tipo': 'Projeção'
-    })
-    
-    dados_historicos = dados_timeline.copy()
-    dados_historicos['tipo'] = 'Histórico'
-    
-    return dados_historicos, projecao_df, modelo
-
-
-def fazer_projecao_conservadora(dados_timeline, dias_projecao=30):
-    """Projeção conservadora usando SEMPRE os 3 primeiros dias como base"""
-    if len(dados_timeline) < 2:
-        return None
-    
-    dados = dados_timeline.sort_values('data')
-    
-    # SEMPRE USAR OS 3 PRIMEIROS DIAS para o modelo
-    dados_3_primeiros = dados.head(3)  # ← 29/10, 30/10, 31/10
-    
-    media = dados_3_primeiros['valor_total'].mean()
-    ultimo_valor = dados_3_primeiros['valor_total'].iloc[-1]
-    
-    crescimento_maximo = media * 0.02   
-    
-    if len(dados_3_primeiros) > 1:
-        crescimento_historico = (ultimo_valor - dados_3_primeiros['valor_total'].iloc[0]) / (len(dados_3_primeiros) - 1)
-        crescimento_suavizado = min(crescimento_historico, crescimento_maximo)
-    else:
-        crescimento_suavizado = crescimento_maximo
-    
-    crescimento_suavizado = max(crescimento_suavizado, 0)
-    
-    ultima_data = dados['data'].max()
-    projecoes = []
-    
-    for i in range(1, dias_projecao + 1):
-        valor_projetado = ultimo_valor + (crescimento_suavizado * i)
-        limite_superior = media * 1.5
-        valor_projetado = min(valor_projetado, limite_superior)
-        projecoes.append(valor_projetado)
-    
-    datas_futuras = [ultima_data + timedelta(days=i) for i in range(1, dias_projecao + 1)]
-    
-    projecao_df = pd.DataFrame({
-        'data': datas_futuras,
-        'valor_total': projecoes,
-        'tipo': 'Projeção (Conservadora)'
-    })
-    
-    # Retornar TODOS os dados para exibição
-    dados['tipo'] = 'Histórico'
-    return dados, projecao_df, crescimento_suavizado
-
-
-
-def fazer_projecao_inteligente(dados_timeline, dias_projecao=30):
-     
-    if len(dados_timeline) < 2:
-        return None
-    
-    if len(dados_timeline) >= 7:
-         
-        return fazer_projecao_linear(dados_timeline, dias_projecao)
-    else:
-         
-        return fazer_projecao_conservadora(dados_timeline, dias_projecao)
-
-# =============================================
-# VERIFICAÇÃO DAS SECRETS
-# =============================================
-
-def verificar_secrets():
-    
-    st.sidebar.subheader("🔍 Status da Conexão")
-    
-    secrets_necessarias = ["DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_PORT"]
-    todas_configuradas = True
-    
-    for secret in secrets_necessarias:
-        if secret in st.secrets:
-            st.sidebar.success(f"✅ {secret}")
-        else:
-            st.sidebar.error(f"❌ {secret}")
-            todas_configuradas = False
-    
-    return todas_configuradas
-    
-
-def carregar_dados():
-     
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        
-        # 1. LINHA DO TEMPO
-        query_timeline = """
-        SELECT 
-            DATE("created_at") as data,
-            COUNT(*) as quantidade,
-            SUM(total) as valor_total
-        FROM payments 
-        WHERE "created_at" IS NOT NULL
-        GROUP BY DATE("created_at")
-        ORDER BY data DESC
-        LIMIT 180;
-        """
-        timeline_data = pd.read_sql(query_timeline, conn)
-
-        # 2. TOP PRATOS
-        query_pratos = """            
-        SELECT 
-            p.name as prato,
-            p.category as categoria,
-            SUM(oi.quantity) as quantidade_vendida,
-            SUM(oi.quantity * CAST(p.price as NUMERIC)) as valor_total
-        FROM order_itens oi
-        JOIN products p ON oi.product_id = p.id
-        WHERE p.category IN ('pratos', 'pratos_do_dia')
-        GROUP BY p.name, p.category
-        ORDER BY quantidade_vendida DESC
-        LIMIT 10;
-        """
-        top_pratos = pd.read_sql(query_pratos, conn)
-
-        # 3. RANKING GARÇONS
-        query_garcons = """           
-        SELECT 
-            w.name as garcom,
-            COUNT(o.id) as total_pedidos,
-            SUM(p.total) as valor_total_vendido,
-            AVG(p.total) as ticket_medio
-        FROM orders o
-        JOIN waiters w ON o."waiter_id" = w.id
-        JOIN payments p ON o.id = p."order_id"
-        GROUP BY w.name
-        ORDER BY total_pedidos DESC
-        LIMIT 10;
-        """
-        ranking_garcons = pd.read_sql(query_garcons, conn)
-    
-        # 4. SATISFAÇÃO
-        query_satisfacao = """
-        SELECT 
-            note as nota,
-            COUNT(*) as quantidade
-        FROM "satisfactions_survey" 
-        WHERE note IS NOT NULL
-        GROUP BY note
-        ORDER BY note;
-        """
-        satisfacao_data = pd.read_sql(query_satisfacao, conn)
-
-        # 5. TIPOS DE PAGAMENTO
-        query_pagamentos = """
-        SELECT 
-            payment_type as tipo_pagamento,
-            COUNT(*) as quantidade,
-            SUM(total) as valor_total
-        FROM payments 
-        WHERE status = 'paid'
-        GROUP BY payment_type
-        ORDER BY quantidade DESC;
-        """
-        pagamentos_tipo = pd.read_sql(query_pagamentos, conn)
-        
-        conn.close()
-
-        # Processar dados
-        if not timeline_data.empty:
-            timeline_data['data'] = pd.to_datetime(timeline_data['data'])
-        
-        return {
-            'timeline': timeline_data,
-            'top_pratos': top_pratos,
-            'garcons': ranking_garcons,
-            'satisfacao': satisfacao_data,
-            'pagamentos_tipo': pagamentos_tipo
-        }
-        
-    except Exception as e:
-        st.error(f"Erro ao carregar dados: {e}")
-        return None
-
-# =============================================
-# CARREGAR DADOS
+# CARREGAR DADOS (agora importado)
 # =============================================
 
 with st.spinner("🔄 Carregando dados..."):
@@ -243,6 +20,7 @@ with st.spinner("🔄 Carregando dados..."):
 if dados is None:
     st.error("❌ Não foi possível carregar os dados.")
     st.stop()
+
 
 # =============================================
 # SIDEBAR - RESUMO
@@ -256,7 +34,7 @@ if not dados['timeline'].empty:
     st.sidebar.metric("📅 Período", f"{len(dados['timeline'])} dias")
 
 if not dados['timeline'].empty:
-    projecao_resultado = fazer_projecao_inteligente(dados['timeline'])
+    projecao_resultado = projecao_media(dados['timeline'])
     if projecao_resultado:
         dados_historicos, projecao_df, modelo = projecao_resultado
         projecao_total_30d = projecao_df['valor_total'].sum()
@@ -317,18 +95,18 @@ if not dados['timeline'].empty:
     num_dias = len(dados['timeline'])
     
     if num_dias >= 7:
-        projecao_resultado = fazer_projecao_linear(dados['timeline'])
+        projecao_resultado = projecao_linear(dados['timeline'])
         st.success(f"✅ Projeção com regressão linear ({num_dias} dias de dados)")
     else:
-        projecao_resultado = fazer_projecao_conservadora(dados['timeline'])
-    
+        projecao_resultado = projecao_media(dados['timeline'])
+
     if projecao_resultado:
         dados_historicos, projecao_df, modelo = projecao_resultado
         
         # Mostrar dados históricos primeiro
-        st.subheader("📊 Dados Históricos (Base para Projeção)")
+        st.subheader("📊 Dados Históricos dos Últimos 3 Dias")
         dados_sorted = dados_historicos.sort_values('data', ascending=False)
-        dados_3_ultimos = dados_sorted.head(3)  # ← APENAS 3 MAIS RECENTES para exibição
+        dados_3_ultimos = dados_sorted.head(3)
         
         # SEMPRE 3 COLUNAS para os 3 dias mais recentes
         cols_historico = st.columns(3)
@@ -343,10 +121,10 @@ if not dados['timeline'].empty:
                         f"{int(row['quantidade'])} pagamentos"
                     )
 
-        st.markdown("\n")
+        st.markdown("\n \n")
 
         # Métricas da projeção
-        st.subheader("📈 Métricas da Projeção")
+        st.subheader("📈 Métricas da Projeção com base nos dias 29/10, 30/10, 31/10")
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
